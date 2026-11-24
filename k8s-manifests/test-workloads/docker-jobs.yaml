@@ -1,0 +1,58 @@
+# Test Docker workloads — routed by the UKS scheduler to docker worker nodes
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: docker-job-high-mem
+  namespace: uks-research
+spec:
+  completions: 5
+  parallelism: 2
+  template:
+    metadata:
+      labels:
+        app: docker-job
+        runtime: docker
+        workload-type: high-mem
+    spec:
+      schedulerName: uks-scheduler   # <-- tells K8s to use our custom scheduler
+      restartPolicy: Never
+      containers:
+        - name: job
+          image: busybox:latest
+          command: ["sh", "-c", "echo UKS-scheduled docker job running; sleep 20; echo done"]
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: docker-job-low-mem
+  namespace: uks-research
+spec:
+  completions: 5
+  parallelism: 2
+  template:
+    metadata:
+      labels:
+        app: docker-job
+        runtime: docker
+        workload-type: low-mem
+    spec:
+      schedulerName: uks-scheduler
+      restartPolicy: Never
+      containers:
+        - name: job
+          image: busybox:latest
+          command: ["sh", "-c", "echo UKS-scheduled light docker job; sleep 10; echo done"]
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "50m"
+            limits:
+              memory: "64Mi"
+              cpu: "100m"

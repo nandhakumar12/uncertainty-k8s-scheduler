@@ -1,0 +1,40 @@
+# Deploys the UKS scheduler daemon as a pod on the control plane
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: uks-scheduler
+  namespace: kube-system
+  labels:
+    component: uks-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: uks-scheduler
+  template:
+    metadata:
+      labels:
+        component: uks-scheduler
+    spec:
+      serviceAccountName: uks-scheduler
+      # Run on the control plane node
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      containers:
+        - name: uks-scheduler
+          # Replace <YOUR_AWS_ACCOUNT_ID> and <REGION> with your values
+          # e.g. 730335396069.dkr.ecr.us-east-1.amazonaws.com/uks-scheduler-workloads:latest
+          image: 730335396069.dkr.ecr.us-east-1.amazonaws.com/uks-scheduler-workloads:latest
+          imagePullPolicy: Always
+          command: ["python", "scheduler_daemon.py"]
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"

@@ -1,0 +1,31 @@
+# Test Wasm workloads — routed by the UKS scheduler to the wasm worker node
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wasm-job-lightweight
+  namespace: uks-research
+spec:
+  completions: 4
+  parallelism: 2
+  template:
+    metadata:
+      labels:
+        app: wasm-job
+        runtime: wasm
+        workload-type: lightweight
+    spec:
+      schedulerName: uks-scheduler   # <-- UKS will route this to the wasm node
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/runtime-wasm: "true"
+      containers:
+        - name: wasm-task
+          image: busybox:latest
+          command: ["sh", "-c", "echo UKS-scheduled wasm job running; sleep 5; echo done"]
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "25m"
+            limits:
+              memory: "32Mi"
+              cpu: "50m"

@@ -1,0 +1,9 @@
+# .gitignore — exclude generated files and secrets
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.pem
+*.key
+results/*.png
+data/google_trace_v3_sample.csv
