@@ -14,6 +14,7 @@ import os
 from kubernetes import client, config, watch
 from src.schedulers import UncertaintyAwareScheduler
 from src.bnn_model import BayesianSchedulerPredictor
+from src.data_loader import Job
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,13 +104,17 @@ def build_job_features(pod):
         total_mem_req += parse_memory_to_mb(req.get("memory", "64Mi"))
 
     labels = pod.metadata.labels or {}
-    is_wasm = 1 if labels.get("runtime") == "wasm" else 0
+    is_wasm = labels.get("runtime") == "wasm"
+    job_type = "wasm" if is_wasm else "docker"
 
-    return {
-        "cpu_req": total_cpu_req,
-        "mem_req": total_mem_req,
-        "is_wasm": is_wasm
-    }
+    # Return a Job object so the BNN predictor can read .job_type, .cpu_req, .mem_req
+    return Job(
+        job_id=0,
+        job_type=job_type,
+        cpu_req=total_cpu_req,
+        mem_req=total_mem_req,
+        true_runtime=0.0
+    )
 
 
 def pick_best_node(scheduler, predictor, pod, node_info, v1):

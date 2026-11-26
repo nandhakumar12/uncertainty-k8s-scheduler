@@ -54,6 +54,14 @@ class UncertaintyAwareScheduler(BaseScheduler):
         self.gamma = gamma      # penalty for stacking uncertain jobs together
         self.burst_k = burst_k  # confidence multiplier for BNN predictive uncertainty
 
+    def _score_node(self, free_mb, mu, sigma):
+        # Standalone scoring for the live scheduler daemon (no Node object needed)
+        burst_buffer = self.burst_k * sigma
+        remaining = free_mb - (mu + burst_buffer)
+        if remaining < 0:
+            return self.alpha * free_mb - self.beta * abs(remaining) * 10.0
+        return self.alpha * free_mb
+
     def schedule(self, job, nodes, bnn_predictor):
         best_node = None
         best_score = -float('inf')
