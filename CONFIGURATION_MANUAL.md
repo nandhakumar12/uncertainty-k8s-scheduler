@@ -1,189 +1,109 @@
-# UKS Project — Configuration Manual
+# Configuration Manual — UKS Project Setup
 
-## From-Scratch Setup Guide for the Uncertainty-Aware Kubernetes Scheduler
-
-**Author:** Nandhakumar Thangaraju (x25126067)  
-**Programme:** MSc in Cloud Computing, National College of Ireland  
-**Date:** November 2026
+**Nandhakumar Thangaraju — x25126067**  
+**MSc Cloud Computing, National College of Ireland**  
+**November 2026**
 
 ---
 
-## Table of Contents
+## What this document covers
 
-1. [Prerequisites](#1-prerequisites)
-2. [AWS Account Setup](#2-aws-account-setup)
-3. [Terraform Infrastructure Provisioning](#3-terraform-infrastructure-provisioning)
-4. [Kubernetes Cluster Bootstrap](#4-kubernetes-cluster-bootstrap)
-5. [Worker Node Join Process](#5-worker-node-join-process)
-6. [Flannel CNI Networking](#6-flannel-cni-networking)
-7. [Wasm Worker Configuration](#7-wasm-worker-configuration)
-8. [Python Environment and BNN Model](#8-python-environment-and-bnn-model)
-9. [Deploying the UKS Scheduler Daemon](#9-deploying-the-uks-scheduler-daemon)
-10. [Running the Benchmark Simulation](#10-running-the-benchmark-simulation)
-11. [Submitting Real Jobs to the Cluster](#11-submitting-real-jobs-to-the-cluster)
-12. [Troubleshooting](#12-troubleshooting)
-13. [Multi-Cloud Extension (Azure / GCP)](#13-multi-cloud-extension-azure--gcp)
+This manual walks through how I set up my Uncertainty-Aware Kubernetes Scheduler (UKS) research project from scratch. It covers everything — the AWS infrastructure, the Kubernetes cluster, the Python scheduler code, and running real workloads on it. If someone needs to recreate this setup or understand how it all fits together, this is the guide.
 
 ---
 
-## 1. Prerequisites
+## 1. What I needed before starting
 
-Before beginning the setup, ensure the following software and accounts are available on your local development machine.
+On my local Windows laptop I had these installed:
 
-**Local machine requirements:**
+- Python 3.9 (from python.org)
+- Git (for pushing code to GitHub)
+- VS Code (for editing code and running terminal commands)
+- Terraform (I downloaded version 1.5 from terraform.io)
+- AWS CLI v2 (installed via the MSI installer from AWS docs)
 
-| Tool | Version | Purpose |
-|------|---------|---------|
-| Terraform | >= 1.5.0 | Infrastructure-as-Code for AWS provisioning |
-| AWS CLI v2 | >= 2.13 | Interacting with AWS services from the terminal |
-| Python | >= 3.9 | Running the BNN model and benchmark simulation |
-| Git | >= 2.30 | Version control and pushing to GitHub |
-| VS Code (optional) | Latest | Code editing and terminal access |
+For cloud access, I used the AWS Academy Learner Lab provided through NCI. The lab gives temporary credentials that last about 4 hours per session. One important thing I learned early on — you cannot create custom IAM roles in the Academy environment. There is a Service Control Policy (SCP) that blocks it. So every EC2 instance has to use the pre-existing `LabRole` and `LabInstanceProfile` that AWS Academy provides.
 
-**Cloud accounts:**
+I also set up a GitHub account to host the code so I could pull it onto the cluster later.
 
-- AWS Academy Learner Lab account (provided by NCI). The lab provisions temporary credentials with a 4-hour session limit. The IAM role `LabRole` and instance profile `LabInstanceProfile` are pre-created and must be used for all EC2 and S3 resources since AWS Academy blocks custom IAM role creation.
-- GitHub account for hosting the source code repository.
+---
 
-**Install Python dependencies locally:**
+## 2. Getting the AWS lab running
+
+I logged into [awsacademy.instructure.com](https://awsacademy.instructure.com), went to my Cloud Computing course module, and clicked Modules then AWS Academy Learner Lab then Start Lab. It takes a couple of minutes for the dot to go green. Once it was green I clicked AWS to open the console.
+
+I made sure to select **us-east-1 (N. Virginia)** as the region in the top right corner. All my resources are in that region.
+
+For terminal access I used **AWS CloudShell** — it's the terminal icon at the bottom left of the AWS console. It already has the AWS CLI configured with the lab credentials so I didn't need to mess with access keys.
+
+I also created a key pair for SSH access to the EC2 instances:
 
 ```bash
-pip install simpy numpy pandas matplotlib scikit-learn
-```
-
----
-
-## 2. AWS Account Setup
-
-### 2.1 Starting the AWS Academy Lab
-
-1. Log in to [awsacademy.instructure.com](https://awsacademy.instructure.com).
-2. Navigate to your Cloud Computing course module.
-3. Click **Modules → AWS Academy Learner Lab → Start Lab**.
-4. Wait for the indicator dot to turn **green** (approximately 2 minutes).
-5. Click **AWS** to open the AWS Management Console.
-6. Select region **us-east-1 (N. Virginia)** in the top-right corner.
-
-### 2.2 Opening AWS CloudShell
-
-1. In the AWS Console, click the **CloudShell** icon (bottom-left of the console).
-2. CloudShell provides a browser-based terminal with the AWS CLI pre-configured using your temporary lab credentials.
-3. All Terraform and kubectl commands in this guide are run from CloudShell unless stated otherwise.
-
-### 2.3 Creating the EC2 Key Pair
-
-```bash
-aws ec2 create-key-pair \
-  --key-name uks-research-keypair \
-  --query 'KeyMaterial' \
-  --output text > ~/uks-research-keypair.pem
-
+aws ec2 create-key-pair --key-name uks-research-keypair \
+  --query 'KeyMaterial' --output text > ~/uks-research-keypair.pem
 chmod 400 ~/uks-research-keypair.pem
 ```
 
-This key pair is used to SSH into EC2 instances from CloudShell when needed. For routine access, EC2 Instance Connect (browser-based) is simpler and does not require the .pem file.
+In practice I ended up using EC2 Instance Connect (browser-based) most of the time because it's simpler — you just click Connect in the EC2 console and get a terminal in a new tab. No key file needed.
 
 ---
 
-## 3. Terraform Infrastructure Provisioning
+## 3. Setting up the AWS infrastructure with Terraform
 
-### 3.1 Project Structure
+I wrote Terraform files to provision everything. The files are in the `terraform/` folder in my project repo. Here is what each file does:
 
-The Terraform code lives in the `terraform/` directory at the root of the project:
+- `main.tf` — sets the AWS provider and region
+- `vpc.tf` — creates a VPC (10.0.0.0/16) with two subnets in different availability zones, an internet gateway, and a route table so the instances can reach the internet
+- `security_groups.tf` — opens port 22 (SSH), port 6443 (Kubernetes API), port 8472 (Flannel VXLAN overlay), and port 10250 (kubelet)
+- `iam.tf` — references the existing LabRole and LabInstanceProfile (does not try to create new ones since Academy blocks that)
+- `ec2.tf` — creates 4 EC2 instances
+- `ecr.tf` — creates an Elastic Container Registry repo called `uks-scheduler-workloads`
+- `s3.tf` — creates an S3 bucket for storing trace data
+- `variables.tf` — has configurable stuff like region and instance types
+- `outputs.tf` — prints the public IPs after the apply finishes
 
-```
-terraform/
-├── main.tf                # Provider and backend config
-├── vpc.tf                 # VPC, subnets, internet gateway, route table
-├── security_groups.tf     # Ingress/egress rules for SSH, Kubernetes API, Flannel
-├── iam.tf                 # Uses pre-existing LabRole/LabInstanceProfile
-├── ec2.tf                 # 4 EC2 instances (1 control plane + 2 Docker + 1 Wasm)
-├── ecr.tf                 # Elastic Container Registry for scheduler images
-├── s3.tf                  # S3 bucket for trace data storage
-├── variables.tf           # Configurable parameters (region, instance types)
-├── outputs.tf             # Prints public IPs after apply
-└── user_data/
-    ├── control_plane.sh   # Bootstrap script for the K8s control plane
-    ├── docker_worker.sh   # Bootstrap script for Docker worker nodes
-    └── wasm_worker.sh     # Bootstrap script for the Wasm worker node
-```
+The 4 EC2 instances are:
 
-### 3.2 Key Design Decisions
+| Name | Type | RAM | What it does |
+|------|------|-----|-------------|
+| uks-control-plane | t3.medium | 4 GB | Runs the Kubernetes master (API server, etcd, scheduler) |
+| uks-docker-worker-01 | t3.medium | 4 GB | Runs Docker container workloads |
+| uks-docker-worker-02 | t3.medium | 4 GB | Runs Docker container workloads |
+| uks-wasm-worker-01 | t3.small | 2 GB | Runs lightweight Wasm workloads |
 
-**Instance types:**
+All of them run Ubuntu 22.04 LTS. I had to use Ubuntu specifically because WasmEdge needs glibc 2.31 or higher, and Amazon Linux 2 only has 2.26. The AMI comes from Canonical (owner ID `099720109477`).
 
-| Node | Instance Type | vCPUs | RAM | Purpose |
-|------|--------------|-------|-----|---------|
-| `uks-control-plane` | t3.medium | 2 | 4 GB | Kubernetes API server, etcd, kube-scheduler |
-| `uks-docker-worker-01` | t3.medium | 2 | 4 GB | Runs Docker container workloads |
-| `uks-docker-worker-02` | t3.medium | 2 | 4 GB | Runs Docker container workloads |
-| `uks-wasm-worker-01` | t3.small | 2 | 2 GB | Runs lightweight Wasm workloads |
+Each instance has a user data script that runs on first boot (`user_data/control_plane.sh`, `docker_worker.sh`, `wasm_worker.sh`). These scripts install containerd and Kubernetes packages automatically.
 
-**Operating System:** Ubuntu 22.04 LTS (Canonical AMI, owner `099720109477`). Ubuntu 22.04 is mandatory because WasmEdge requires glibc >= 2.31, which Amazon Linux 2 does not provide.
-
-**Networking:** A single VPC (`10.0.0.0/16`) with two subnets across different Availability Zones. The security group allows inbound SSH (port 22), Kubernetes API (port 6443), Flannel VXLAN (port 8472/UDP), and kubelet (port 10250).
-
-### 3.3 Running Terraform
-
-Upload the entire `terraform/` directory to CloudShell using **Actions → Upload file**, or clone from GitHub:
+To deploy everything I ran:
 
 ```bash
-cd ~
-git clone https://github.com/nandhakumar12/uncertainty-k8s-scheduler.git
-cd uncertainty-k8s-scheduler/terraform
-```
-
-Then initialise and apply:
-
-```bash
+cd ~/uncertainty-k8s-scheduler/terraform
 terraform init
 terraform plan -out=tfplan
 terraform apply tfplan
 ```
 
-Terraform will output the public IP addresses of all four EC2 instances. Record these for the next steps.
-
-```
-Outputs:
-  control_plane_ip  = "54.81.26.149"
-  docker_worker_1_ip = "54.84.163.232"
-  docker_worker_2_ip = "54.235.27.254"
-  wasm_worker_ip     = "54.235.11.204"
-```
+After it finished I got the public IPs for all 4 instances.
 
 ---
 
-## 4. Kubernetes Cluster Bootstrap
+## 4. Bootstrapping the Kubernetes cluster
 
-### 4.1 Connect to the Control Plane
+### Setting up the control plane
 
-Use EC2 Instance Connect from the AWS Console:
+I connected to the control plane using EC2 Instance Connect — in the EC2 console I clicked on the control plane instance, then Connect, then EC2 Instance Connect tab, then Connect. A terminal opened in a new browser tab.
 
-1. Go to **EC2 → Instances**.
-2. Select `uks-control-plane`.
-3. Click **Connect → EC2 Instance Connect → Connect**.
-
-### 4.2 Verify kubeadm Initialised
-
-The `user_data/control_plane.sh` script should have already initialised the cluster. Verify:
+The user data script should have already run `kubeadm init`. I checked by running:
 
 ```bash
 kubectl get nodes -o wide
 ```
 
-If the control plane is the only node listed, the initialisation succeeded. If `kubectl` is not found, the user data script may have failed — check the cloud-init log:
+If it showed the control plane node as Ready, the init worked. If kubectl wasn't found or nothing showed up, I would have needed to run the init manually:
 
 ```bash
-sudo cat /var/log/cloud-init-output.log | tail -50
-```
-
-### 4.3 Manual kubeadm Init (if user data failed)
-
-If the cluster was not initialised automatically:
-
-```bash
-sudo kubeadm init \
-  --pod-network-cidr=10.244.0.0/16 \
+sudo kubeadm init --pod-network-cidr=10.244.0.0/16 \
   --apiserver-advertise-address=$(hostname -I | awk '{print $1}')
 
 mkdir -p $HOME/.kube
@@ -191,41 +111,37 @@ sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
 sudo chown $(id -u):$(id -g) $HOME/.kube/config
 ```
 
----
+### Getting worker nodes to join
 
-## 5. Worker Node Join Process
-
-### 5.1 Generate a Fresh Join Token
-
-On the **control plane**:
+First I generated a join token on the control plane:
 
 ```bash
 kubeadm token create --print-join-command
 ```
 
-This outputs a command like:
+This gave me a command like:
 
 ```
 kubeadm join 10.0.1.243:6443 --token gl7iuk.jm99bjmid745q4xw \
-  --discovery-token-ca-cert-hash sha256:502eabaed7e00ee862f285f58c288cd2ade80ada8391fd584a48af4cadc67724
+  --discovery-token-ca-cert-hash sha256:502eaba...
 ```
 
-### 5.2 Prepare Each Worker Node
+Then I connected to each worker node using EC2 Instance Connect and ran some setup commands before joining. This was necessary because the workers needed kernel modules and containerd configuration that the user data scripts didn't always set up properly.
 
-Connect to each worker node using EC2 Instance Connect. On every worker, run the following kernel module and networking setup:
+On each worker I ran:
 
 ```bash
-# Load required kernel modules for container networking
+# These kernel modules are needed for container networking
 sudo modprobe overlay
 sudo modprobe br_netfilter
 
-# Persist modules across reboots
+# Make them load on reboot too
 cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
 overlay
 br_netfilter
 EOF
 
-# Enable bridge networking and IP forwarding
+# Turn on bridge networking and IP forwarding
 cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
@@ -234,9 +150,7 @@ EOF
 sudo sysctl --system
 ```
 
-### 5.3 Configure containerd
-
-containerd is pre-installed on Ubuntu 22.04 but needs to be configured for Kubernetes:
+Then I configured containerd properly. This was important — without the SystemdCgroup setting, kubeadm join fails with a container runtime error:
 
 ```bash
 sudo mkdir -p /etc/containerd
@@ -245,11 +159,7 @@ sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/conf
 sudo systemctl restart containerd
 ```
 
-The `SystemdCgroup = true` setting ensures containerd uses the same cgroup driver as kubelet. Without this, kubeadm join fails with a container runtime error.
-
-### 5.4 Install Kubernetes Components (if missing)
-
-If the worker does not have `kubeadm` installed:
+On my Wasm worker, kubeadm wasn't even installed (the user data script had failed silently). So I had to install the Kubernetes packages manually:
 
 ```bash
 sudo apt-get update -y
@@ -266,247 +176,177 @@ sudo apt-get install -y kubelet kubeadm kubectl
 sudo apt-mark hold kubelet kubeadm kubectl
 ```
 
-### 5.5 Join the Cluster
+After that, on each worker I ran the join command:
 
 ```bash
-sudo kubeadm join 10.0.1.243:6443 --token <TOKEN> \
-  --discovery-token-ca-cert-hash sha256:<HASH>
+sudo kubeadm join 10.0.1.243:6443 --token gl7iuk.jm99bjmid745q4xw \
+  --discovery-token-ca-cert-hash sha256:502eaba...
 ```
 
-Replace `<TOKEN>` and `<HASH>` with the values from step 5.1.
-
-### 5.6 Verify All Nodes
-
-Back on the control plane:
+Back on the control plane I verified everything:
 
 ```bash
 kubectl get nodes -o wide
 ```
 
-Expected output:
+Output:
 
 ```
-NAME                    STATUS   ROLES           AGE   VERSION   INTERNAL-IP   OS-IMAGE
-uks-control-plane       Ready    control-plane   8d    v1.29.0   10.0.1.243    Ubuntu 22.04.5 LTS
-uks-docker-worker-17fd  Ready    <none>          8d    v1.29.0   10.0.2.49     Ubuntu 22.04.5 LTS
-uks-docker-worker-2d69  Ready    <none>          8d    v1.29.0   10.0.1.197    Ubuntu 22.04.5 LTS
-ip-10-0-2-64            Ready    <none>          42s   v1.29.15  10.0.2.64     Ubuntu 22.04.5 LTS
+NAME                    STATUS   ROLES           AGE   VERSION    INTERNAL-IP   OS-IMAGE
+uks-control-plane       Ready    control-plane   8d    v1.29.0    10.0.1.243    Ubuntu 22.04.5 LTS
+uks-docker-worker-17fd  Ready    <none>          8d    v1.29.0    10.0.2.49     Ubuntu 22.04.5 LTS
+uks-docker-worker-2d69  Ready    <none>          8d    v1.29.0    10.0.1.197    Ubuntu 22.04.5 LTS
+ip-10-0-2-64            Ready    <none>          42s   v1.29.15   10.0.2.64     Ubuntu 22.04.5 LTS
 ```
+
+All 4 nodes showing Ready.
 
 ---
 
-## 6. Flannel CNI Networking
+## 5. Installing Flannel (pod networking)
 
-Kubernetes requires a Container Network Interface (CNI) plugin for pod-to-pod communication across nodes. Without a CNI, pods remain stuck in `ContainerCreating` state.
+Without a CNI plugin, pods can't get IP addresses and they get stuck in ContainerCreating forever. I found this out the hard way — my first workload deployment just sat there and the describe output said "failed to load flannel subnet.env."
 
-### 6.1 Install Flannel
-
-On the control plane:
+I installed Flannel on the control plane:
 
 ```bash
 kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
 ```
 
-### 6.2 Verify Flannel Pods
+Then checked that all Flannel pods were running:
 
 ```bash
 kubectl get pods -n kube-flannel -o wide
 ```
 
-There should be one Flannel pod per node, all showing `1/1 Running`. If any pod is in `CrashLoopBackOff`, connect to that node and ensure the kernel modules from section 5.2 are loaded.
+There should be one Flannel pod per node. If any of them were in CrashLoopBackOff, it meant that node was missing the br_netfilter kernel module — I had to SSH into that node and run the modprobe commands from section 4.
 
 ---
 
-## 7. Wasm Worker Configuration
+## 6. Labelling the Wasm worker node
 
-### 7.1 Label the Wasm Node
-
-The Wasm worker must be labelled so that the scheduler can distinguish it from Docker workers:
+The scheduler needs to know which node is the Wasm worker so it can route lightweight jobs there. I did this with a label:
 
 ```bash
-kubectl label node <WASM_NODE_NAME> kubernetes.io/runtime-wasm=true
+kubectl label node ip-10-0-2-64 kubernetes.io/runtime-wasm=true
 ```
 
-Replace `<WASM_NODE_NAME>` with the actual node name shown in `kubectl get nodes` (for example, `ip-10-0-2-64`).
+(The node name `ip-10-0-2-64` came from `kubectl get nodes` — the Wasm worker joined with its IP as its hostname instead of a custom name.)
 
-### 7.2 Verify the Label
+I verified it with:
 
 ```bash
 kubectl get nodes --show-labels | grep wasm
 ```
 
-The Wasm node should show `kubernetes.io/runtime-wasm=true` in its labels column.
-
 ---
 
-## 8. Python Environment and BNN Model
+## 7. The Python code
 
-### 8.1 Project Structure
+The project code lives in `uncertainty-k8s-scheduler/` and I pushed it to GitHub at [github.com/nandhakumar12/uncertainty-k8s-scheduler](https://github.com/nandhakumar12/uncertainty-k8s-scheduler).
+
+Here is how the files are organised:
 
 ```
 uncertainty-k8s-scheduler/
-├── scheduler_daemon.py        # Real Kubernetes scheduler daemon
-├── run_experiments.py         # SimPy benchmark (1,000 simulated jobs)
-├── plot_results.py            # Generates 300 DPI publication chart
-├── requirements.txt           # Python dependencies
-├── Dockerfile                 # Container packaging for the scheduler
+├── scheduler_daemon.py      -- the real scheduler that talks to Kubernetes
+├── run_experiments.py       -- runs the simulation benchmark (1,000 jobs)
+├── plot_results.py          -- makes the results chart
+├── requirements.txt         -- Python dependencies
+├── Dockerfile               -- for packaging as a container
 ├── data/
-│   ├── generate_trace_dataset.py   # Generates synthetic trace CSV
-│   └── google_trace_v3_sample.csv  # 5,000 tasks from Google Cluster Trace v3
+│   ├── generate_trace_dataset.py  -- creates the trace CSV
+│   └── google_trace_v3_sample.csv -- 5,000 tasks based on Google Cluster Trace v3
 ├── src/
-│   ├── bnn_model.py           # Bayesian Neural Network (MC Dropout)
-│   ├── data_loader.py         # Google Cluster Trace data loader
-│   ├── schedulers.py          # 3 scheduler implementations (Default, Deterministic, UKS)
-│   └── simulator.py           # SimPy discrete-event cluster simulator
-├── k8s-manifests/
-│   ├── uks-scheduler/
-│   │   ├── rbac.yaml          # RBAC permissions for the scheduler
-│   │   └── deployment.yaml    # Kubernetes Deployment for the scheduler pod
-│   └── test-workloads/
-│       ├── docker-jobs.yaml   # Docker test jobs with schedulerName: uks-scheduler
-│       └── wasm-jobs.yaml     # Wasm test jobs with schedulerName: uks-scheduler
-└── results/
-    └── benchmark_results.png  # Generated benchmark chart
+│   ├── bnn_model.py         -- Bayesian Neural Network with MC Dropout
+│   ├── data_loader.py       -- loads and parses the trace data
+│   ├── schedulers.py        -- the 3 scheduler implementations
+│   └── simulator.py         -- SimPy cluster simulator
+└── k8s-manifests/
+    ├── uks-scheduler/
+    │   ├── rbac.yaml         -- permissions for the scheduler
+    │   └── deployment.yaml   -- deploys the scheduler as a pod
+    └── test-workloads/
+        ├── docker-jobs.yaml  -- test Docker jobs
+        └── wasm-jobs.yaml    -- test Wasm jobs
 ```
 
-### 8.2 Generate the Google Cluster Trace Dataset
+### How the BNN works (quick version)
 
-The dataset is a 5,000-row CSV synthesised from the statistical distributions reported in Google Cluster Trace v3. Each row represents a task with the following columns:
+The BNN is a small neural network (3 inputs, 64 hidden, 32 hidden, 1 output) written in pure NumPy. I didn't use PyTorch or TensorFlow because PyTorch had DLL issues on my Windows machine and I didn't want the extra dependency.
 
-| Column | Description |
-|--------|-------------|
-| `task_id` | Unique integer identifier |
-| `job_type` | `docker` or `wasm` |
-| `is_wasm` | Binary flag (0 or 1) |
-| `cpu_req` | CPU cores requested |
-| `mem_req` | Memory in arbitrary units requested |
-| `true_runtime` | Actual runtime in seconds |
-| `burst_ratio` | Ratio of peak memory to requested memory |
-| `peak_mem` | Actual peak memory consumption |
+It trains on 3,000 rows from the Google Cluster Trace CSV. Training takes about 3 seconds. The clever part is Monte Carlo Dropout — during prediction it runs 30 forward passes with random dropout active each time. The average of those 30 predictions is the expected runtime (mu) and the spread is the uncertainty (sigma). A high sigma means the model isn't sure what will happen, which usually means it's a volatile Docker job.
 
-```bash
-cd uncertainty-k8s-scheduler
-python data/generate_trace_dataset.py
+### How the scheduler uses the BNN
+
+The scheduler gets (mu, sigma) for each incoming job, then scores every node. The score formula is basically:
+
+```
+Score = (free memory on the node) - (penalty if the node can't handle a worst-case memory burst)
 ```
 
-This creates `data/google_trace_v3_sample.csv`.
-
-### 8.3 BNN Architecture
-
-The Bayesian Neural Network is implemented in pure NumPy (no PyTorch or TensorFlow dependency) in `src/bnn_model.py`. The key design choices:
-
-- **Architecture:** 3 input features → 64 hidden units → 32 hidden units → 1 output
-- **Activation:** ReLU
-- **Weight Initialisation:** He / Kaiming normal
-- **Dropout Rate:** 0.15 (applied during both training and inference)
-- **Optimiser:** Adam (learning rate 0.005, 35 epochs, batch size 64)
-- **Uncertainty Estimation:** Monte Carlo Dropout with 30 stochastic forward passes during inference. The mean of the 30 predictions gives the expected runtime (mu) and the standard deviation gives the epistemic uncertainty (sigma).
-
-### 8.4 Install Dependencies on the Control Plane
-
-```bash
-sudo apt-get install -y python3-pip
-cd ~/uncertainty-k8s-scheduler
-pip3 install -r requirements.txt
-```
+The burst is estimated as `3.5 × sigma`. If a node has enough free memory to absorb that burst, it gets no penalty. If it doesn't, the penalty makes the score drop significantly and the scheduler picks a different node.
 
 ---
 
-## 9. Deploying the UKS Scheduler Daemon
+## 8. Getting the code onto the cluster
 
-The scheduler daemon (`scheduler_daemon.py`) is a Python process that runs on the control plane and acts as a custom Kubernetes scheduler. It continuously watches for pods with `schedulerName: uks-scheduler`, runs the BNN to estimate memory uncertainty, scores each candidate node, and binds the pod to the best-scoring node.
+On the control plane I cloned my repo and installed the Python dependencies:
 
-### 9.1 Direct Execution (Recommended for Testing)
+```bash
+cd ~
+git clone https://github.com/nandhakumar12/uncertainty-k8s-scheduler.git
+cd uncertainty-k8s-scheduler
+
+sudo apt-get install -y python3-pip
+pip3 install -r requirements.txt
+```
+
+The requirements are: simpy, numpy, pandas, matplotlib, scikit-learn, and kubernetes (the Python client).
+
+---
+
+## 9. Running the scheduler daemon
+
+I ran the scheduler daemon directly on the control plane. It doesn't need Docker — it's just a Python script that talks to the Kubernetes API using the kubeconfig that's already on the node.
 
 ```bash
 cd ~/uncertainty-k8s-scheduler
 python3 scheduler_daemon.py
 ```
 
-Expected startup output:
+It printed:
 
 ```
-2026-11-24 13:50:00 [UKS] Loaded local kubeconfig
-2026-11-24 13:50:00 [UKS] Initialising BNN predictor from Google Cluster Trace data...
-2026-11-24 13:50:03 [UKS] BNN ready.
-2026-11-24 13:50:03 [UKS] UKS scheduler watching for pods with schedulerName=uks-scheduler
+[UKS] Loaded local kubeconfig
+[UKS] Initialising BNN predictor from Google Cluster Trace data...
+[UKS] BNN ready.
+[UKS] UKS scheduler watching for pods with schedulerName=uks-scheduler
 ```
 
-### 9.2 UKS Scoring Formula
-
-For each unscheduled pod, the daemon evaluates every candidate node using:
-
-**Score = alpha × FreeMemory − RiskPenalty**
-
-Where `RiskPenalty = beta × |FreeMemory − (mu + burst_k × sigma)| × 10` if the node does not have enough headroom to absorb the worst-case memory burst.
-
-The tuned hyperparameters are: alpha = 1.0, beta = 2.5, gamma = 0.8, burst_k = 3.5.
+I left this running in one terminal tab.
 
 ---
 
-## 10. Running the Benchmark Simulation
+## 10. Submitting real jobs
 
-The simulation is independent of the live cluster and can be run on any machine with Python installed.
-
-```bash
-cd uncertainty-k8s-scheduler
-python run_experiments.py
-```
-
-This runs 1,000 simulated jobs through three schedulers:
-
-1. **Default Kube-Scheduler (LeastAllocated)** — baseline.
-2. **Deterministic ML Scheduler (Point mu)** — uses BNN mean only, ignores uncertainty.
-3. **Uncertainty-Aware Scheduler (Proposed UKS)** — uses both mu and sigma.
-
-Expected output:
-
-```
-Scheduler                                  | Completed | OOMKills | Pending | Fail Rate | Makespan
-Default Kube-Scheduler (LeastAllocated)    | 896       | 103      | 1       |  10.40%   |   238.37
-Deterministic ML Scheduler (Point mu)      | 896       | 103      | 1       |  10.40%   |   238.37
-Uncertainty-Aware Scheduler (Proposed)     | 928       | 72       | 0       |   7.20%   |   238.37
-
-[KEY RESEARCH FINDING]
-* Proposed scheduler reduced OOMKills by 30.1%
-```
-
-To generate the publication chart:
-
-```bash
-python plot_results.py
-```
-
-The chart is saved to `results/benchmark_results.png` at 300 DPI.
-
----
-
-## 11. Submitting Real Jobs to the Cluster
-
-With the scheduler daemon running (section 9.1), open a second terminal on the control plane:
-
-### 11.1 Create the Namespace
+In a second terminal tab on the control plane, I created the namespace and applied the RBAC permissions:
 
 ```bash
 kubectl create namespace uks-research
-```
-
-### 11.2 Apply the RBAC Permissions
-
-```bash
 kubectl apply -f k8s-manifests/uks-scheduler/rbac.yaml
 ```
 
-### 11.3 Submit the Test Workloads
+Then I submitted the test workloads:
 
 ```bash
 kubectl apply -f k8s-manifests/test-workloads/docker-jobs.yaml
 kubectl apply -f k8s-manifests/test-workloads/wasm-jobs.yaml
 ```
 
-### 11.4 Observe Scheduler Decisions
+These jobs have `schedulerName: uks-scheduler` in their spec, so the default kube-scheduler ignores them and my custom daemon picks them up.
 
-Switch back to the terminal running the daemon. The output will show the BNN evaluating each pod and the scoring logic selecting a node:
+Switching back to the daemon terminal, I saw output like:
 
 ```
 [UKS] New pod to schedule: uks-research/docker-job-high-mem-xxxxx
@@ -516,74 +356,68 @@ Switch back to the terminal running the daemon. The output will show the BNN eva
 [UKS] Bound pod docker-job-high-mem-xxxxx → uks-docker-worker-17fd (score-based)
 ```
 
-### 11.5 Verify Pod Placement
+That's the BNN calculating the memory uncertainty and the scheduler picking the node with the most headroom. Docker jobs went to the Docker workers, Wasm jobs went to the Wasm worker.
+
+I verified pod placement with:
 
 ```bash
 kubectl get pods -n uks-research -o wide
 ```
 
-Docker jobs should appear on `uks-docker-worker-17fd` and `uks-docker-worker-2d69`. Wasm jobs should appear on `ip-10-0-2-64` (the Wasm-labelled node).
-
 ---
 
-## 12. Troubleshooting
+## 11. Running the benchmark simulation
 
-### Common Issues and Fixes
-
-| Issue | Cause | Fix |
-|-------|-------|-----|
-| `kubeadm: command not found` on worker | Kubernetes packages not installed | Follow section 5.4 to install kubelet, kubeadm, kubectl |
-| `failed to load flannel subnet.env` | br_netfilter module not loaded | Run `sudo modprobe br_netfilter` and apply sysctl (section 5.2) |
-| `containerd.io: Conflicts: containerd` | docker.io conflicts with existing containerd | Do not install docker.io on nodes running kubelet. Use containerd only. |
-| Pods stuck in `ContainerCreating` | Flannel CNI not installed | Run `kubectl apply -f kube-flannel.yml` (section 6.1) |
-| `SystemdCgroup` error during kubeadm join | containerd misconfigured | Generate and edit containerd config (section 5.3) |
-| `Permission denied (publickey)` via SSH | Key not on CloudShell, or wrong permissions | Upload .pem to CloudShell, run `chmod 400` |
-| AWS Academy session expired | 4-hour lab timer ran out | Go to Learner Lab → Start Lab → wait for green dot |
-| `cannot create IAM role` | AWS Academy SCP restriction | Use the pre-existing `LabRole` / `LabInstanceProfile` only |
-| Docker image build fails on control plane | docker.io conflicts with containerd | Run Python scheduler directly instead (section 9.1) |
-
----
-
-## 13. Multi-Cloud Extension (Azure / GCP)
-
-The UKS scheduler is cloud-agnostic by design — it communicates only with the standard Kubernetes API (nodes, pods, bindings). It can be deployed on any cloud platform that supports Kubernetes.
-
-### 13.1 Azure Deployment Option
-
-| Component | Azure Service | Notes |
-|-----------|--------------|-------|
-| VM Instances | Azure VMs (B2s / B2ms) | Ubuntu 22.04, same kubeadm setup |
-| Container Registry | Azure Container Registry (ACR) | Replace ECR with ACR |
-| Networking | Azure VNet + NSG | Equivalent to VPC + Security Groups |
-| Managed K8s (alternative) | AKS | Cannot easily replace scheduler in AKS |
-
-**Key commands for Azure:**
+The simulation is separate from the live cluster. It tests 1,000 jobs across 3 schedulers using SimPy. I ran it on my local machine:
 
 ```bash
-# Create resource group
-az group create --name uks-rg --location westeurope
-
-# Create VMs
-az vm create --resource-group uks-rg --name uks-control-plane \
-  --image Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest \
-  --size Standard_B2ms --admin-username ubuntu --generate-ssh-keys
+cd uncertainty-k8s-scheduler
+python run_experiments.py
 ```
 
-### 13.2 GCP Deployment Option
+Results:
 
-| Component | GCP Service | Notes |
-|-----------|------------|-------|
-| VM Instances | Compute Engine (e2-medium) | Ubuntu 22.04 |
-| Container Registry | Artifact Registry | Replace ECR |
-| Networking | VPC + Firewall Rules | Equivalent setup |
-| Managed K8s (alternative) | GKE | Custom scheduler possible but complex |
+```
+Default Kube-Scheduler (LeastAllocated)    | 896 completed | 103 OOMKills | 10.40% fail rate
+Deterministic ML Scheduler (Point mu)      | 896 completed | 103 OOMKills | 10.40% fail rate
+Uncertainty-Aware Scheduler (Proposed)     | 928 completed |  72 OOMKills |  7.20% fail rate
 
-### 13.3 Multi-Cloud Architecture
+Proposed scheduler reduced OOMKills by 30.1%
+```
 
-A true multi-cloud deployment would have worker nodes across different cloud providers, all joining the same Kubernetes control plane. The UKS scheduler would then make placement decisions considering not just memory uncertainty but also cross-cloud latency and cost.
+To generate the chart:
 
-This extension is documented as future work in the dissertation.
+```bash
+python plot_results.py
+```
+
+This saves `results/benchmark_results.png` at 300 DPI.
 
 ---
 
-*End of Configuration Manual*
+## 12. Problems I ran into and how I fixed them
+
+| What went wrong | Why | What I did |
+|----------------|-----|-----------|
+| `kubeadm: command not found` on the Wasm worker | The user data script failed silently — Kubernetes packages never installed | Installed kubelet, kubeadm, kubectl manually (section 4) |
+| Pods stuck in ContainerCreating | No CNI plugin installed | Installed Flannel (section 5) |
+| Flannel pods crashing on Docker workers | br_netfilter kernel module wasn't loaded | Ran modprobe and sysctl commands on each worker |
+| `SystemdCgroup` error during kubeadm join | containerd was using the wrong cgroup driver | Generated a new containerd config and set SystemdCgroup to true |
+| Wasm worker joined with IP as hostname | Hostname wasn't set in the user data script | Used the IP-based name (`ip-10-0-2-64`) for all kubectl commands |
+| docker.io install conflicted with containerd | Ubuntu sees them as conflicting packages | Skipped Docker entirely — ran the scheduler as a plain Python script |
+| PyTorch DLL errors on Windows | Missing Visual C++ runtime | Rewrote the BNN in pure NumPy instead |
+| AWS Academy blocked IAM role creation | Service Control Policy restriction | Used the pre-existing LabRole and LabInstanceProfile |
+| SSH permission denied from CloudShell | Key file wasn't in CloudShell's filesystem | Used EC2 Instance Connect instead (no key needed) |
+| Lab session expired mid-work | 4-hour timer | Went to Learner Lab and clicked Start Lab again |
+
+---
+
+## 13. Multi-cloud notes
+
+My scheduler only talks to the standard Kubernetes API — it doesn't use any AWS-specific services for the actual scheduling decisions. This means it would work the same way on Azure VMs or GCP Compute Engine, as long as the worker nodes are running Ubuntu with Kubernetes and joined to a cluster.
+
+For a multi-cloud setup I would create worker VMs on Azure or GCP, install kubeadm on them, and join them to the same control plane using the token from `kubeadm token create --print-join-command`. The scheduler would see them as additional nodes and score them the same way. This is documented as future work in my dissertation.
+
+---
+
+*Last updated: November 2026*
